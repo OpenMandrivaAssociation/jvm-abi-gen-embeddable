@@ -1,0 +1,96 @@
+diff -ruN a/compiler/backend/src/org/jetbrains/kotlin/codegen/inline/SMAPBuilder.kt b/compiler/backend/src/org/jetbrains/kotlin/codegen/inline/SMAPBuilder.kt
+--- a/compiler/backend/src/org/jetbrains/kotlin/codegen/inline/SMAPBuilder.kt	2026-09-28 14:02:30.000000000 +0200
++++ b/compiler/backend/src/org/jetbrains/kotlin/codegen/inline/SMAPBuilder.kt	2026-11-12 18:39:47.388716106 +0100
+@@ -31,7 +31,7 @@
+ 
+         val debugMappings = linkedMapOf<Pair<String, String>, FileMapping>()
+         for (fileMapping in fileMappings) {
+-            for ((val _ = source, val dest, val range, val callSite) in fileMapping.lineMappings) {
++            for ((_, dest, range, callSite) in fileMapping.lineMappings) {
+                 callSite?.let { (line, file, path) ->
+                     debugMappings.getOrPut(file to path) { FileMapping(file, path) }.mapNewInterval(line, dest, range)
+                 }
+@@ -95,7 +95,8 @@
+         super.visitLineNumber(smapCopier.mapLineNumber(line), start)
+ 
+     override fun visitLocalVariable(name: String, descriptor: String, signature: String?, start: Label, end: Label, index: Int) =
+-        if (JvmAbi.isFakeLocalVariableForInline(name))
++        if (name.startsWith(JvmAbi.LOCAL_VARIABLE_NAME_PREFIX_INLINE_FUNCTION) ||
++            name.startsWith(JvmAbi.LOCAL_VARIABLE_NAME_PREFIX_INLINE_ARGUMENT))
+             super.visitLocalVariable(updateCallSiteLineNumber(name, smapCopier::mapLineNumber), descriptor, signature, start, end, index)
+         else
+             super.visitLocalVariable(name, descriptor, signature, start, end, index)
+diff -ruN a/compiler/plugin-api/src/org/jetbrains/kotlin/compiler/plugin/CommandLineProcessor.kt b/compiler/plugin-api/src/org/jetbrains/kotlin/compiler/plugin/CommandLineProcessor.kt
+--- a/compiler/plugin-api/src/org/jetbrains/kotlin/compiler/plugin/CommandLineProcessor.kt	2026-09-28 14:02:30.000000000 +0200
++++ b/compiler/plugin-api/src/org/jetbrains/kotlin/compiler/plugin/CommandLineProcessor.kt	2026-11-12 18:39:47.383590418 +0100
+@@ -41,7 +41,7 @@
+     }
+ 
+     fun CompilerConfiguration.applyOptionsFrom(map: Map<String, List<String>>, pluginOptions: Collection<AbstractCliOption>) {
+-        for ([key, values] in map) {
++        for ((key, values) in map) {
+             val option = pluginOptions.firstOrNull { it.optionName == key } ?: continue
+ 
+             for (value in values) {
+diff -ruN a/compiler/plugin-api/src/org/jetbrains/kotlin/compiler/plugin/CompilerPluginRegistrar.kt b/compiler/plugin-api/src/org/jetbrains/kotlin/compiler/plugin/CompilerPluginRegistrar.kt
+--- a/compiler/plugin-api/src/org/jetbrains/kotlin/compiler/plugin/CompilerPluginRegistrar.kt	2026-09-28 14:02:30.000000000 +0200
++++ b/compiler/plugin-api/src/org/jetbrains/kotlin/compiler/plugin/CompilerPluginRegistrar.kt	2026-11-12 18:39:47.381940839 +0100
+@@ -25,11 +25,14 @@
+     abstract fun ExtensionStorage.registerExtensions(configuration: CompilerConfiguration)
+ 
+     class ExtensionStorage {
++        private val registeredExtensionsField =
++            mutableMapOf<ExtensionPointDescriptor<*>, MutableList<Any>>()
+         val registeredExtensions: Map<ExtensionPointDescriptor<*>, List<Any>>
+-            field = mutableMapOf<ExtensionPointDescriptor<*>, MutableList<Any>>()
++            get() = registeredExtensionsField
+ 
++        private val disposablesField = mutableListOf<PluginDisposable>()
+         val disposables: List<PluginDisposable>
+-            field = mutableListOf<PluginDisposable>()
++            get() = disposablesField
+ 
+         operator fun <T : Any> get(descriptor: ExtensionPointDescriptor<T>): List<T> {
+             @Suppress("UNCHECKED_CAST")
+@@ -37,7 +40,7 @@
+         }
+ 
+         fun <T : Any> ExtensionPointDescriptor<T>.registerExtension(extension: T) {
+-            registeredExtensions.getOrPut(this, ::mutableListOf).add(extension)
++            registeredExtensionsField.getOrPut(this, ::mutableListOf).add(extension)
+         }
+ 
+         /**
+@@ -49,7 +52,7 @@
+          */
+         @Suppress("unused")
+         fun registerDisposable(disposable: PluginDisposable) {
+-            disposables += disposable
++            disposablesField += disposable
+         }
+     }
+ 
+diff -ruN a/plugins/jvm-abi-gen/src/org/jetbrains/kotlin/jvm/abi/JvmAbiClassInfoBuilder.kt b/plugins/jvm-abi-gen/src/org/jetbrains/kotlin/jvm/abi/JvmAbiClassInfoBuilder.kt
+--- a/plugins/jvm-abi-gen/src/org/jetbrains/kotlin/jvm/abi/JvmAbiClassInfoBuilder.kt	2026-09-28 14:02:30.000000000 +0200
++++ b/plugins/jvm-abi-gen/src/org/jetbrains/kotlin/jvm/abi/JvmAbiClassInfoBuilder.kt	2026-11-12 18:39:47.385346008 +0100
+@@ -37,7 +37,7 @@
+ 
+     fun buildClassInfo(): Map<String, AbiClassInfo> {
+         if (removePrivateClasses) {
+-            for ([className, info] in abiClassInfo.toMap()) {
++            for ((className, info) in abiClassInfo.toMap()) {
+                 if (info != AbiClassInfo.Deleted) {
+                     keepInterfacesOf(className)
+                 }
+diff -ruN a/plugins/jvm-abi-gen/src/org/jetbrains/kotlin/jvm/abi/JvmAbiOutputExtension.kt b/plugins/jvm-abi-gen/src/org/jetbrains/kotlin/jvm/abi/JvmAbiOutputExtension.kt
+--- a/plugins/jvm-abi-gen/src/org/jetbrains/kotlin/jvm/abi/JvmAbiOutputExtension.kt	2026-09-28 14:02:30.000000000 +0200
++++ b/plugins/jvm-abi-gen/src/org/jetbrains/kotlin/jvm/abi/JvmAbiOutputExtension.kt	2026-11-12 18:39:47.387246159 +0100
+@@ -53,7 +53,7 @@
+         val preserveDeclarationOrder: Boolean,
+         val treatInternalAsPrivate: Boolean,
+     ) : OutputFileCollection {
+-        private val classesToBeDeleted = abiClassInfos.mapNotNullTo(mutableSetOf()) { [className, action] ->
++        private val classesToBeDeleted = abiClassInfos.mapNotNullTo(mutableSetOf()) { (className, action) ->
+             className.takeIf { action == AbiClassInfo.Deleted }
+         }
+ 
